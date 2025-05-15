@@ -4,42 +4,18 @@ from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
 import random
 import string
 import time
-import re
+import threading
+import json
 
 TOKEN = "8152061099:AAE5k3IricRRWn-OuYnkkG8cJf1WS0utLps"
 bot = telebot.TeleBot(TOKEN)
 
-# ------------------ Механизм фильтрации нецензурных слов ------------------
-bad_words = {
-    "блин": 1, "Блин": 1, "бЛин": 1,
-    "хрен": 1, "Хрен": 1,
-    "дурак": 1, "Дурак": 1,
-    "идиот": 2, "Идиот": 2,
-    "кретин": 2, "Кретин": 2,
-    "ублюдок": 3, "Ублюдок": 3,
-    "сука": 4, "Сука": 4,
-    "пиздец": 5, "Пиздец": 5,
-    "хуй": 5, "Хуй": 5,
-    "хуесос": 5, "Хуесос": 5
-}
-
-user_warnings = {}   # { user_id: warning_count }
-chat_ban_until = {}  # { user_id: ban_end_timestamp }
-
-def censor_text(text):
-    max_severity = 0
-
-    def replace_func(match):
-        word = match.group(0)
-        severity = bad_words.get(word, 0)
-        nonlocal max_severity
-        if severity > max_severity:
-            max_severity = severity
-        return word[0] + "*" * (len(word)-1)
-
-    pattern = re.compile(r'\b(' + '|'.join(map(re.escape, bad_words.keys())) + r')\b', re.IGNORECASE)
-    censored = pattern.sub(replace_func, text)
-    return censored, max_severity
+# ---------------------------------------------------------------------------------
+# Вместо bad_words и censor_text – реализуем функцию для модерации.
+def moderate_text(text):
+    # Здесь можно добавить проверку текста на плохие слова и вернуть скорректированный текст.
+    # Пока функция возвращает исходный текст и severity = 0.
+    return text, 0
 
 def get_ban_duration(severity):
     if severity == 1:
@@ -54,19 +30,62 @@ def get_ban_duration(severity):
         return 3 * 60 * 60
     return 10 * 60
 
-# -------------- Данные пользователей и состояний --------------
+# ---------------------------------------------------------------------------------
+# Данные пользователей и состояний
 user_coins = {}           # Баланс пользователей (начальный баланс 0)
-user_roles = {}           # Статусы пользователей ("user", "admin", "banned")
-waiting_for_username = {} # Для ввода (например, "About user")
-waiting_for_message = {}  # Для передачи сообщений (чат, ответы)
-waiting_for_input = {}    # Для ввода данных (промокоды, настройки и т.д.)
-waiting_for_transfer = {}             # Для перевода монет; ключ – sender_id, значение – dict с данными перевода
-waiting_for_transfer_question = {}    # Для вопросов по переводу: ключ – получатель, значение – sender_id
+user_roles = {}           # Роли: "user", "admin", "banned"
+waiting_for_username = {} # Состояния ввода (например, "About user")
+waiting_for_message = {}  # Для отправки сообщений (чат, ответы)
+waiting_for_input = {}    # Для ввода данных (промокоды, настройки и пр.)
+waiting_for_transfer = {}             # Для перевода коинов (ключ – sender_id)
+waiting_for_transfer_question = {}    # Для вопросов по переводу (ключ – получатель)
 
-admin_id = 2120919981     # ID администратора
-promo_codes = {}          # Список активных промокодов
+admin_id = 2120919981     # Основной ID администратора
+promo_codes = {}          # Активные промокоды
 
-# -------------------- Главное меню --------------------
+# Новые глобальные переменные
+click_value = 1.0         # Множитель для операции Click
+last_click_time = {}      # Для антиспама кликов (user_id: время последнего клика)
+transfer_block = {}       # Блокировка переводов для конкретного пользователя (user_id: bool)
+autoclickers = {}         # Статус автокликера для пользователя (user_id: bool)
+heavy_load = False        # Флаг симуляции высокой нагрузки
+
+# ---------------------------------------------------------------------------------
+# Функция для имитации нагрузки
+def check_load(user_id):
+    global heavy_load
+    if heavy_load:
+        bot.send_message(user_id, "Подождите!")
+        time.sleep(1)
+
+# Функции сохранения и загрузки данных (через JSON)
+def save_data():
+    data = {
+        "user_coins": user_coins,
+        "user_roles": user_roles,
+        "promo_codes": promo_codes,
+    }
+    try:
+        with open("data.json", "w") as f:
+            json.dump(data, f)
+        print("Данные сохранены")
+    except Exception as e:
+        print("Ошибка сохранения:", e)
+
+def load_data():
+    global user_coins, user_roles, promo_codes
+    try:
+        with open("data.json", "r") as f:
+            data = json.load(f)
+            user_coins = data.get("user_coins", {})
+            user_roles = data.get("user_roles", {})
+            promo_codes = data.get("promo_codes", {})
+        print("Данные загружены")
+    except Exception as e:
+        print("Ошибка загрузки данных:", e)
+
+# ---------------------------------------------------------------------------------
+# Главное меню
 def get_main_menu(user_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row(KeyboardButton("Click"), KeyboardButton("Users online"), KeyboardButton("Balance"))
@@ -75,12 +94,15 @@ def get_main_menu(user_id):
     markup.row(KeyboardButton("Create promo code"), KeyboardButton("Activate promo code"))
     markup.row(KeyboardButton("Transfer coins"))
     markup.row(KeyboardButton("Rules"))
-    if user_id == admin_id:
+    if user_roles.get(user_id, "user") == "admin" or user_id == admin_id:
         markup.row(KeyboardButton("Settings"))
+    markup.row(KeyboardButton("User Settings"))
+    markup.row(KeyboardButton("Autoclicker (ON-OFF)"))
     markup.row(KeyboardButton("Reset all"))
     return markup
 
-# ---------------- Команда /start ----------------
+# ---------------------------------------------------------------------------------
+# Команда /start
 @bot.message_handler(commands=["start"])
 def start(message):
     user_id = message.chat.id
@@ -93,19 +115,28 @@ def start(message):
     main_menu = get_main_menu(user_id)
     bot.send_message(user_id, "Выбери действие:", reply_markup=main_menu)
 
-# ---------------- Обработчик основного меню (Reply Keyboard) ----------------
+# ---------------------------------------------------------------------------------
+# Обработчик основного меню (Reply Keyboard)
 @bot.message_handler(func=lambda message: message.text in [
     "Click", "Users online", "About your account", "About user", "Chat",
-    "Create promo code", "Activate promo code", "Balance", "Rules", "Settings", "Reset all", "Transfer coins"
+    "Create promo code", "Activate promo code", "Balance", "Rules",
+    "Settings", "Reset all", "Transfer coins", "User Settings", "Autoclicker (ON-OFF)"
 ])
 def main_menu_handler(message):
     user_id = message.chat.id
+    check_load(user_id)
     text = message.text
     if user_roles.get(user_id) == "banned":
         bot.send_message(user_id, "Ты заблокирован и не можешь использовать бота.")
         return
+
     if text == "Click":
-        user_coins[user_id]  += 1
+        current_time = time.time()
+        if user_id in last_click_time and current_time - last_click_time[user_id] < 1:
+            bot.send_message(user_id, "Подождите!")
+            return
+        last_click_time[user_id] = current_time
+        user_coins[user_id] += click_value
         bot.send_message(user_id, f"🟢 {message.from_user.first_name} нажал Click! Теперь у тебя {user_coins[user_id]} коинов.")
     elif text == "Users online":
         online_users = len([uid for uid in user_roles if user_roles[uid] != "banned"])
@@ -140,7 +171,7 @@ def main_menu_handler(message):
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите промокод для активации:", reply_markup=markup)
     elif text == "Settings":
-        if user_id == admin_id:
+        if user_roles.get(user_id) == "admin" or user_id == admin_id:
             waiting_for_input[user_id] = "settings_pending"
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("Повысить юзера до админа", callback_data="set_promote"))
@@ -148,6 +179,10 @@ def main_menu_handler(message):
             markup.row(InlineKeyboardButton("Забанить юзера", callback_data="set_ban"))
             markup.row(InlineKeyboardButton("Разбанить юзера", callback_data="set_unban"))
             markup.row(InlineKeyboardButton("Reset coins", callback_data="set_reset"))
+            markup.row(InlineKeyboardButton("Get User Info", callback_data="get_user_info"))
+            markup.row(InlineKeyboardButton("Send message", callback_data="send_message"))
+            markup.row(InlineKeyboardButton("Save data", callback_data="save_data"),
+                       InlineKeyboardButton("Load data", callback_data="load_data"))
             markup.row(InlineKeyboardButton("Cancel", callback_data="cancel"))
             bot.send_message(user_id, "Выберите действие для администратора:", reply_markup=markup)
         else:
@@ -156,45 +191,69 @@ def main_menu_handler(message):
         markup = InlineKeyboardMarkup()
         for uid in user_roles:
             if uid != user_id and user_roles[uid] != "banned":
+                if transfer_block.get(uid, False):
+                    continue
                 markup.add(InlineKeyboardButton(f"{uid}", callback_data=f"transfer_{uid}"))
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Выберите пользователя для перевода коинов:", reply_markup=markup)
-    elif text == "Rules":
+    elif text == "User Settings":
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("Exit", callback_data="exit_rules"))
-        bot.send_message(user_id, "Правила:\n"
-                                  "Оскорбления, плохие слова, маты – бан от 10 минут до 24 часов.\n"
-                                  "Спам – бан (возможно перманентный).\n"
-                                  "Нарушение правил бота-кликера – бан (на любое время).", reply_markup=markup)
+        markup.row(InlineKeyboardButton("Set click", callback_data="set_click"))
+        markup.row(InlineKeyboardButton("Block transfer for all", callback_data="block_transfer"))
+        markup.row(InlineKeyboardButton("Unblock transfer for all", callback_data="unblock_transfer"))
+        markup.row(InlineKeyboardButton("Cancel", callback_data="cancel"))
+        bot.send_message(user_id, "Выберите действие:", reply_markup=markup)
+    elif text == "Autoclicker (ON-OFF)":
+        if autoclickers.get(user_id, False):
+            autoclickers[user_id] = False
+            bot.send_message(user_id, "Автокликер выключен.")
+        else:
+            autoclickers[user_id] = True
+            bot.send_message(user_id, "Автокликер включен.")
+            threading.Thread(target=autoclicker_thread, args=(user_id,), daemon=True).start()
 
-# ---------------- Обработчик inline-кнопок ----------------
+# Фоновая функция автокликера для пользователя
+def autoclicker_thread(user_id):
+    while autoclickers.get(user_id, False):
+        time.sleep(1)
+        user_coins[user_id] += 1
+        try:
+            bot.send_message(user_id, f"Автокликер: +1 коин, теперь у тебя {user_coins[user_id]} коинов.")
+        except Exception as e:
+            print("Ошибка в автокликере:", e)
+
+# ---------------------------------------------------------------------------------
+# Обработчик inline‑кнопок
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.message.chat.id
+    check_load(user_id)
     if user_roles.get(user_id) == "banned":
         bot.answer_callback_query(call.id, "Ты заблокирован и не можешь использовать бота.")
         return
-    if call.data.startswith("chat_"):
-        target_user = int(call.data.split("_")[1])
+    data = call.data
+
+    if data.startswith("chat_"):
+        target_user = int(data.split("_")[1])
         waiting_for_message[user_id] = target_user
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите сообщение для пользователя:", reply_markup=markup)
-    elif call.data.startswith("reply_"):
+    elif data.startswith("reply_"):
         sender_id = call.message.chat.id
-        receiver_id = int(call.data.split("_")[1])
+        receiver_id = int(data.split("_")[1])
         waiting_for_message[sender_id] = receiver_id
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(sender_id, "Введите ответное сообщение:", reply_markup=markup)
-    elif call.data.startswith("transfer_"):
-        target_user = int(call.data.split("_")[1])
+    elif data.startswith("transfer_") and not data.startswith("transfer_send") and not data.startswith("transfer_accept") and not data.startswith("transfer_decline") and not data.startswith("transfer_question"):
+        target_user = int(data.split("_")[1])
         waiting_for_transfer[user_id] = {"target": target_user}
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите количество коинов для перевода:", reply_markup=markup)
-    elif call.data.startswith("transfer_send_"):
-        sender_id = int(call.data.replace("transfer_send_", ""))
+    elif data.startswith("transfer_send_"):
+        sender_id = int(data.replace("transfer_send_", ""))
         if sender_id in waiting_for_transfer:
             req = waiting_for_transfer[sender_id]
             if req.get("target") == call.message.chat.id:
@@ -209,8 +268,8 @@ def callback_handler(call):
             else:
                 bot.send_message(call.message.chat.id, "Ошибка: вы не являетесь выбранным получателем этого перевода.")
             waiting_for_transfer.pop(sender_id, None)
-    elif call.data.startswith("transfer_accept_"):
-        sender_id = int(call.data.replace("transfer_accept_", ""))
+    elif data.startswith("transfer_accept_"):
+        sender_id = int(data.replace("transfer_accept_", ""))
         if sender_id in waiting_for_transfer:
             req = waiting_for_transfer[sender_id]
             if req.get("target") == call.message.chat.id:
@@ -225,55 +284,97 @@ def callback_handler(call):
             else:
                 bot.send_message(call.message.chat.id, "Ошибка: вы не являетесь выбранным получателем этого перевода.")
             waiting_for_transfer.pop(sender_id, None)
-    elif call.data.startswith("transfer_decline_"):
-        sender_id = int(call.data.replace("transfer_decline_", ""))
+    elif data.startswith("transfer_decline_"):
+        sender_id = int(data.replace("transfer_decline_", ""))
         if sender_id in waiting_for_transfer:
             bot.send_message(call.message.chat.id, "Вы отказались от перевода. Перевод отменён.")
             bot.send_message(sender_id, f"Пользователь {call.message.chat.id} отказался от вашего перевода.")
             waiting_for_transfer.pop(sender_id, None)
-    elif call.data.startswith("transfer_question_"):
-        sender_id = int(call.data.replace("transfer_question_", ""))
+    elif data.startswith("transfer_question_"):
+        sender_id = int(data.replace("transfer_question_", ""))
         waiting_for_transfer_question[call.message.chat.id] = sender_id
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(call.message.chat.id, "Введите ваш вопрос для отправителя:", reply_markup=markup)
-    elif call.data == "exit_rules":
+    elif data == "exit_rules":
         bot.send_message(user_id, "Вы вышли из просмотра правил.")
     # Действия в настройках администратора
-    elif call.data == "set_promote":
+    elif data == "set_promote":
         waiting_for_input[user_id] = "settings_promote"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите ID пользователя для повышения до админа:", reply_markup=markup)
-    elif call.data == "set_demote":
+    elif data == "set_demote":
         waiting_for_input[user_id] = "settings_demote"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите ID пользователя для понижения до обычного юзера:", reply_markup=markup)
-    elif call.data == "set_ban":
-        # Запуск нового потока: сначала запрос ID, потом причину, потом длительность
+    elif data == "set_ban":
         waiting_for_input[user_id] = "settings_ban_id"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите ID пользователя для бана:", reply_markup=markup)
-    elif call.data == "set_unban":
+    elif data == "set_unban":
         waiting_for_input[user_id] = "settings_unban"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите ID пользователя для разбанивания:", reply_markup=markup)
-    elif call.data == "set_reset":
+    elif data == "set_reset":
         waiting_for_input[user_id] = "settings_reset"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
         bot.send_message(user_id, "Введите ID пользователя для сброса коинов:", reply_markup=markup)
-    elif call.data == "cancel":
+    # Новые действия для администратора
+    elif data == "get_user_info":
+        markup = InlineKeyboardMarkup()
+        for uid in user_coins:
+            markup.add(InlineKeyboardButton(f"User {uid}", callback_data=f"user_info_{uid}"))
+        markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
+        bot.send_message(user_id, "Выберите пользователя:", reply_markup=markup)
+    elif data.startswith("user_info_"):
+        target = int(data.replace("user_info_", ""))
+        info = f"ID: {target}\nКоины: {user_coins.get(target, 0)}\nСтатус: {user_roles.get(target, 'user')}"
+        bot.send_message(user_id, info)
+    elif data == "send_message":
+        markup = InlineKeyboardMarkup()
+        for uid in user_coins:
+            markup.add(InlineKeyboardButton(f"User {uid}", callback_data=f"admin_msg_{uid}"))
+        markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
+        bot.send_message(user_id, "Выберите пользователя для отправки сообщения:", reply_markup=markup)
+    elif data.startswith("admin_msg_"):
+        target = int(data.replace("admin_msg_", ""))
+        waiting_for_input[user_id] = ("admin_send_message", target)
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
+        bot.send_message(user_id, "Введите сообщение для отправки:", reply_markup=markup)
+    elif data == "save_data":
+        save_data()
+        bot.send_message(user_id, "Данные сохранены.")
+    elif data == "load_data":
+        load_data()
+        bot.send_message(user_id, "Данные загружены.")
+    # Действия в настройках пользователя (User Settings)
+    elif data == "set_click":
+        waiting_for_input[user_id] = "set_click"
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Cancel", callback_data="cancel"))
+        bot.send_message(user_id, "Поставь значение клика (от 0.5 до 2):", reply_markup=markup)
+    elif data == "block_transfer":
+        transfer_block[user_id] = True
+        bot.send_message(user_id, "Переводы для вас заблокированы.")
+    elif data == "unblock_transfer":
+        transfer_block[user_id] = False
+        bot.send_message(user_id, "Переводы для вас разблокированы.")
+    elif data == "cancel":
         waiting_for_input.pop(user_id, None)
         waiting_for_message.pop(user_id, None)
         waiting_for_transfer.pop(user_id, None)
         bot.send_message(user_id, "❌ Действие отменено.")
 
-# ---------------- Обработка сообщений для чата с фильтрацией нецензурной лексики ----------------
-@bot.message_handler(func=lambda message: message.chat.id in waiting_for_message)
+# ---------------------------------------------------------------------------------
+# Обработка сообщений для чата (поддержка текстовых и файловых сообщений)
+@bot.message_handler(func=lambda message: message.chat.id in waiting_for_message,
+                     content_types=["text", "photo", "video", "audio", "document", "voice", "sticker"])
 def handle_chat_message(message):
     user_id = message.chat.id
     current_time = time.time()
@@ -282,27 +383,23 @@ def handle_chat_message(message):
         bot.send_message(user_id, f"Вы забанены в чате на {ban_remaining // 60} минут(ы).")
         waiting_for_message.pop(user_id, None)
         return
-    original_text = message.text
-    censored_text, severity = censor_text(original_text)
-    if severity > 0:
-        user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
-        warnings = user_warnings[user_id]
-        bot.send_message(user_id, f"Ваше сообщение изменено из-за нецензурных выражений. Предупреждений: {warnings} из 3.")
-        if warnings >= 3:
-            ban_duration = get_ban_duration(severity)
-            chat_ban_until[user_id] = time.time() + ban_duration
-            bot.send_message(user_id, f"Вы получили бан в чате на {ban_duration // 60} минут(ы) за нецензурную лексику.")
-            waiting_for_message.pop(user_id, None)
-            return
-    receiver_id = waiting_for_message[user_id]
-    bot.send_message(receiver_id, f"Сообщение от {user_id}: {censored_text}",
-                     reply_markup=InlineKeyboardMarkup().add(
-                         InlineKeyboardButton("Ответить", callback_data=f"reply_{user_id}")
-                     ))
+    target_id = waiting_for_message[user_id]
+    if message.content_type == "text":
+        original_text = message.text
+        moderated_text, severity = moderate_text(original_text)
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Ответить", callback_data=f"reply_{user_id}"))
+        bot.send_message(target_id, f"Сообщение от {user_id}: {moderated_text}", reply_markup=markup)
+    else:
+        try:
+            bot.forward_message(target_id, message.chat.id, message.message_id)
+        except Exception as e:
+            bot.send_message(user_id, f"Ошибка пересылки файла: {e}")
     waiting_for_message.pop(user_id, None)
 
-# ---------------- Обработка сообщений для ввода данных (промокоды, настройки и пр.) ----------------
-@bot.message_handler(func=lambda message: message.chat.id in waiting_for_input)
+# ---------------------------------------------------------------------------------
+# Обработка сообщений для ввода (промокоды, настройки и пр.)
+@bot.message_handler(func=lambda message: message.chat.id in waiting_for_input, content_types=["text"])
 def handle_input(message):
     user_id = message.chat.id
     action = waiting_for_input[user_id]
@@ -351,6 +448,11 @@ def handle_input(message):
     elif action == "promo_code":
         if user_input in promo_codes:
             promo = promo_codes[user_input]
+            # Проверка: нельзя активировать свой промокод
+            if promo["creator"] == user_id:
+                bot.send_message(user_id, "Вы не можете активировать свой промокод!")
+                waiting_for_input.pop(user_id)
+                return
             current_time = time.time()
             if current_time > promo["expires"]:
                 bot.send_message(user_id, "Промокод истёк.")
@@ -381,7 +483,7 @@ def handle_input(message):
             user_roles[target] = "admin"
             bot.send_message(user_id, f"Пользователь {target} повышен до админа.")
         except ValueError:
-            bot.send_message(user_id, "Пожалуйста, введите корректный идентификатор пользователя.")
+            bot.send_message(user_id, "Пожалуйста, введите корректный ID пользователя.")
         waiting_for_input.pop(user_id)
     elif action == "settings_demote":
         try:
@@ -393,9 +495,8 @@ def handle_input(message):
             user_roles[target] = "user"
             bot.send_message(user_id, f"Пользователь {target} понижен до обычного юзера.")
         except ValueError:
-            bot.send_message(user_id, "Пожалуйста, введите корректный идентификатор пользователя.")
+            bot.send_message(user_id, "Пожалуйста, введите корректный ID пользователя.")
         waiting_for_input.pop(user_id)
-    # Новый многошаговый процесс для бана:
     elif action == "settings_ban_id":
         try:
             target = int(user_input)
@@ -406,7 +507,7 @@ def handle_input(message):
             waiting_for_input[user_id] = ("settings_ban", target)
             bot.send_message(user_id, "Введите причину бана:")
         except ValueError:
-            bot.send_message(user_id, "Пожалуйста, введите корректный идентификатор пользователя.")
+            bot.send_message(user_id, "Пожалуйста, введите корректный ID пользователя.")
     elif isinstance(action, tuple) and action[0] == "settings_ban" and len(action) == 2:
         target = action[1]
         reason = user_input
@@ -417,7 +518,7 @@ def handle_input(message):
         reason = action[2]
         parts = user_input.split()
         if len(parts) < 2:
-            bot.send_message(user_id, "Пожалуйста, введите число и единицу измерения, например, '10 минут'.")
+            bot.send_message(user_id, "Пожалуйста, введите число и единицу (например, '10 минут').")
             return
         try:
             number = int(parts[0])
@@ -453,7 +554,7 @@ def handle_input(message):
             user_roles[target] = "user"
             bot.send_message(user_id, f"Пользователь {target} разблокирован.")
         except ValueError:
-            bot.send_message(user_id, "Пожалуйста, введите корректный идентификатор пользователя.")
+            bot.send_message(user_id, "Пожалуйста, введите корректный ID пользователя.")
         waiting_for_input.pop(user_id)
     elif action == "settings_reset":
         try:
@@ -465,10 +566,35 @@ def handle_input(message):
             user_coins[target] = 0
             bot.send_message(user_id, f"Коины пользователя {target} сброшены.")
         except ValueError:
-            bot.send_message(user_id, "Пожалуйста, введите корректный идентификатор пользователя.")
+            bot.send_message(user_id, "Пожалуйста, введите корректный ID пользователя.")
+        waiting_for_input.pop(user_id)
+    # Обработка настроек пользователя (User Settings)
+    elif action == "set_click":
+        try:
+            new_value = float(user_input)
+            if 0.5 <= new_value <= 2:
+                global click_value
+                click_value = new_value
+                bot.send_message(user_id, f"Значение клика изменено на {click_value}.")
+            else:
+                bot.send_message(user_id, "Введенное значение должно быть от 0.5 до 2.")
+        except ValueError:
+            bot.send_message(user_id, "Пожалуйста, введите число!")
+        waiting_for_input.pop(user_id)
+    # Обработка админского сообщения
+    elif isinstance(action, tuple) and action[0] == "admin_send_message":
+        target = action[1]
+        text_to_send = user_input
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("Ответить", callback_data=f"admin_reply_{user_id}_{target}"))
+        markup.row(InlineKeyboardButton("Поставить статус (Прочитано)", callback_data=f"admin_status_{user_id}_{target}"))
+        markup.row(InlineKeyboardButton("Игнор", callback_data=f"admin_ignore_{user_id}_{target}"))
+        bot.send_message(target, f"Вы получили от админа ({user_id}) сообщение:\n{text_to_send}", reply_markup=markup)
+        bot.send_message(user_id, "Сообщение отправлено.")
         waiting_for_input.pop(user_id)
 
-# ---------------- Обработка сообщений для ввода суммы при переводе коинов ----------------
+# ---------------------------------------------------------------------------------
+# Обработка сообщений для перевода коинов
 @bot.message_handler(func=lambda message: message.chat.id in waiting_for_transfer and "amount" not in waiting_for_transfer[message.chat.id])
 def handle_transfer_amount(message):
     user_id = message.chat.id
@@ -486,7 +612,7 @@ def handle_transfer_amount(message):
         sender_name = message.from_user.first_name or str(user_id)
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("Перевести ему коины", callback_data=f"transfer_send_{user_id}"))
-        markup.row(InlineKeyboardButton("Отказаться от этого перевода и вернуть коины", callback_data=f"transfer_decline_{user_id}"))
+        markup.row(InlineKeyboardButton("Отказаться от перевода и вернуть коины", callback_data=f"transfer_decline_{user_id}"))
         markup.row(InlineKeyboardButton("Задать вопрос ему", callback_data=f"transfer_question_{user_id}"),
                    InlineKeyboardButton("Принять перевод", callback_data=f"transfer_accept_{user_id}"))
         bot.send_message(target, f"Пользователь {sender_name} (ID: {user_id}) хочет перевести вам {amount} коинов.", reply_markup=markup)
@@ -494,8 +620,9 @@ def handle_transfer_amount(message):
     except ValueError:
         bot.send_message(user_id, "Пожалуйста, введите число!")
 
-# ---------------- Обработка сообщений для вопроса по переводу от получателя ----------------
-@bot.message_handler(func=lambda message: message.chat.id in waiting_for_transfer_question)
+# ---------------------------------------------------------------------------------
+# Обработка сообщений для вопросов по переводу
+@bot.message_handler(func=lambda message: message.chat.id in waiting_for_transfer_question, content_types=["text"])
 def handle_transfer_question(message):
     receiver_id = message.chat.id
     sender_id = waiting_for_transfer_question[receiver_id]
@@ -504,4 +631,5 @@ def handle_transfer_question(message):
     bot.send_message(receiver_id, "Ваш вопрос отправлен.")
     waiting_for_transfer_question.pop(receiver_id, None)
 
+# ---------------------------------------------------------------------------------
 bot.polling()
