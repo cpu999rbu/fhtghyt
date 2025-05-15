@@ -215,7 +215,7 @@ def main_menu_handler(message):
 # Фоновая функция автокликера для пользователя
 def autoclicker_thread(user_id):
     while autoclickers.get(user_id, False):
-        time.sleep(1)
+        time.sleep(0.1)
         user_coins[user_id] += 1
         try:
             bot.send_message(user_id, f"Автокликер: +1 коин, теперь у тебя {user_coins[user_id]} коинов.")
